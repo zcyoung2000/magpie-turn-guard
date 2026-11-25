@@ -64,7 +64,10 @@
 //
 // Recursion: a request already containing a compaction_trigger (this
 // hook's side request, or Codex's own /compact) passes through
-// untouched.
+// untouched — unless its history is already at/over a cap, in which
+// case the provider would reject the compaction itself; then the
+// history is folded first and the trigger re-appended, so the
+// compaction runs on the folded history.
 //
 // Fail-open: any error returns undefined and the request goes out as-is.
 //
@@ -320,11 +323,28 @@ export async function onRequest(body, ctx) {
     const provider = body.model.split("/")[0];
     if (!opts.providers.includes(provider)) return undefined;
 
-    const input = body.input;
+    let input = body.input;
 
-    // Already a compaction request (Codex's own /compact, or this
-    // hook's side request coming back through the gateway): untouched.
-    if (input.some(isTrigger)) return undefined;
+    // A request carrying a compaction_trigger (Codex's own /compact,
+    // or this hook's side request coming back through the gateway)
+    // normally passes through untouched — the anti-recursion guard,
+    // and this hook's own side requests rely on it (they are built
+    // under the caps). One exception: if the history it carries is
+    // already at/over a cap, the provider rejects the compaction
+    // itself — the session that needs compacting most is the one
+    // that can't. Then the trigger is set aside and the history goes
+    // through the normal flow below; any body the flow returns gets
+    // the trigger re-appended, so the compaction runs on the folded
+    // history instead of dying at the cap.
+    let triggerItem = null;
+    if (input.some(isTrigger)) {
+      const histStats = countStats(input.filter((it) => !isTrigger(it)), 0);
+      if (histStats.users < opts.userCap && histStats.turns < opts.turnCap) return undefined;
+      triggerItem = input.find(isTrigger);
+      input = input.filter((it) => !isTrigger(it));
+      body = { ...body, input };
+    }
+    const out = (b) => (triggerItem && b ? { ...b, input: [...b.input, triggerItem] } : b);
 
     const firstUser = input.findIndex(isUserMsg);
     if (firstUser < 0) return undefined;
@@ -384,7 +404,7 @@ export async function onRequest(body, ctx) {
       if (priorItem) {
         sess.updatedAt = Date.now();
         saveState(state);
-        return { ...body, input: effective };
+        return out({ ...body, input: effective });
       }
       return undefined;
     }
@@ -423,17 +443,17 @@ export async function onRequest(body, ctx) {
       if (lastUserIdx < 0) lastUserIdx = firstUser;
 
       const cut = chooseCut(input, restStart + 1, lastUserIdx, opts);
-      if (cut <= restStart) return priorItem ? { ...body, input: effective } : undefined;
+      if (cut <= restStart) return priorItem ? out({ ...body, input: effective }) : undefined;
 
       const foldRaw = input.slice(restStart, cut);
-      if (!foldRaw.length) return priorItem ? { ...body, input: effective } : undefined;
+      if (!foldRaw.length) return priorItem ? out({ ...body, input: effective }) : undefined;
 
       // Mid-history system/developer items keep their place in the
       // live request (before the compaction item); the rest is
       // compacted.
       const keptSys = [...keptSysPrior, ...foldRaw.filter(isSysDev)];
       const toFold = foldRaw.filter((it) => !isSysDev(it));
-      if (!toFold.length) return priorItem ? { ...body, input: effective } : undefined;
+      if (!toFold.length) return priorItem ? out({ ...body, input: effective }) : undefined;
 
       const snapshot = input;
       const baseItem = priorItem;
@@ -520,7 +540,7 @@ export async function onRequest(body, ctx) {
     }
 
     // A previous fold keeps serving while the new one brews.
-    if (priorItem && !nearCap) return { ...body, input: effective };
+    if (priorItem && !nearCap) return out({ ...body, input: effective });
     if (!nearCap) return undefined;
 
     // About to hit the cap: wait for the fold, within the hook
@@ -529,7 +549,7 @@ export async function onRequest(body, ctx) {
       job,
       new Promise((r) => setTimeout(() => r(null), NEAR_CAP_WAIT_MS)),
     ]);
-    if (!landed) return priorItem ? { ...body, input: effective } : undefined;
+    if (!landed) return priorItem ? out({ ...body, input: effective }) : undefined;
     const st2 = loadState();
     const s2 = st2.sessions[headKey];
     if (
@@ -540,12 +560,12 @@ export async function onRequest(body, ctx) {
       hashItems(input.slice(headEnd, headEnd + s2.frontierItems)) === s2.prefixHash
     ) {
       const kept2 = Array.isArray(s2.keptSys) ? s2.keptSys : [];
-      return {
+      return out({
         ...body,
         input: [...head, ...kept2, s2.compactionItem, ...input.slice(headEnd + s2.frontierItems)],
-      };
+      });
     }
-    return priorItem ? { ...body, input: effective } : undefined;
+    return priorItem ? out({ ...body, input: effective }) : undefined;
   } catch {
     return undefined; // fail open: send the request as it came
   }

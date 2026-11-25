@@ -50,7 +50,10 @@ own compaction** when either reaches its threshold:
   predates it) is folded **in slices**: each slice's request carries
   the previous slice's item, and the final item covers everything.
 - Requests already containing a `compaction_trigger` (Codex's own
-  `/compact`, the hook's side requests) pass through untouched.
+  `/compact`, the hook's side requests) pass through untouched —
+  unless their history is already at/over a cap, which the provider
+  would reject: then the history is folded first and the trigger
+  re-appended, so the compaction runs on the folded history.
 - If the client's own token-based compaction rewrites the history, its
   compaction item restarts the counts and this hook's state for the
   old history stops matching and is dropped.
