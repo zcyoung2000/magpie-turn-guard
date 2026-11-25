@@ -1,1 +1,24 @@
-{"description":"Magpie gateway hook: folds long Codex sessions with Codex's own compaction before a provider's user-message / model-turn cap rejects them.","magpie":{"hooks":"turn-guard.hooks.js","name":"turn-guard","options":{"compactModel":"","gatewayTimeoutMs":180000,"gatewayUrl":"http://127.0.0.1:3425/v1","keepRecentTurns":20,"keepRecentUsers":3,"providers":["xingchi"],"turnCap":100,"turnThreshold":70,"userCap":20,"userThreshold":16}},"name":"turn-guard","private":true,"version":"2.0.0"}
+{
+  "description": "Magpie gateway hook: folds long Codex sessions with Codex's own compaction before a provider's user-message / model-turn cap rejects them.",
+  "magpie": {
+    "hooks": "turn-guard.hooks.js",
+    "name": "turn-guard",
+    "options": {
+      "compactModel": "",
+      "gatewayTimeoutMs": 180000,
+      "gatewayUrl": "http://127.0.0.1:3425/v1",
+      "keepRecentTurns": 20,
+      "keepRecentUsers": 3,
+      "providers": [
+        "xingchi"
+      ],
+      "turnCap": 100,
+      "turnThreshold": 95,
+      "userCap": 20,
+      "userThreshold": 19
+    }
+  },
+  "name": "turn-guard",
+  "private": true,
+  "version": "2.0.0"
+}

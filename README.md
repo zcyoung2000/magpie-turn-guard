@@ -55,7 +55,7 @@ GUI's options editor starts from).
 
 ```sh
 magpie plugin add /path/to/magpie-turn-guard
-magpie plugin options /path/to/magpie-turn-guard '{"gatewayTimeoutMs":180000,"userThreshold":16,"turnThreshold":70}'
+magpie plugin options /path/to/magpie-turn-guard '{"gatewayTimeoutMs":180000,"userThreshold":19,"turnThreshold":95}'
 ```
 
 Options can also be edited in the magpie GUI: Plugins page → the
@@ -74,8 +74,8 @@ Set via magpie plugin options (JSON):
 | Option | Default | Meaning |
 |---|---|---|
 | `providers` | `["xingchi"]` | Model-name prefixes the guard applies to |
-| `userThreshold` | `16` | Fold when user messages reach this |
-| `turnThreshold` | `70` | Fold when model turns reach this |
+| `userThreshold` | `19` | Fold when user messages reach this |
+| `turnThreshold` | `95` | Fold when model turns reach this |
 | `userCap` | `20` | Provider hard cap on user messages |
 | `turnCap` | `100` | Provider hard cap on model turns |
 | `keepRecentUsers` | `3` | User turns kept verbatim in the tail |
