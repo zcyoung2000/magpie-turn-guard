@@ -23,6 +23,21 @@
 // official summary user message, so upstream sees a short history:
 // head + one summary user message + the recent tail.
 //
+// Timing: the splice is asynchronous. magpie bounds the whole
+// request-hook chain to roughly 30 s (a hook's gatewayTimeoutMs is
+// clamped to 100–30000 ms), and a compaction side request over a long
+// history routinely takes longer — a hook that waits for it is timed
+// out and its rewritten body discarded (learned the hard way,
+// 2026-11-25: folds completed in the background while the gateway
+// kept the original requests, and the session died at the cap). So
+// crossing a threshold only STARTS the fold in the background; the
+// request goes out as it came, and once the fold has landed in
+// state, later requests splice it in with no model call. The one
+// exception: when the counts are about to hit the cap itself, the
+// hook waits for the in-flight fold (25 s, inside the budget) and
+// splices it into that request — the cap is the one place a late
+// fold is worthless.
+//
 // Incremental: the client resends its full raw history every request,
 // so the hook remembers, per conversation, how many leading items are
 // already folded into the stored compaction item (the "frontier").
@@ -44,8 +59,8 @@
 // developer message or a tool output. On a real 190-call Codex session
 // this count came out at 189. A compaction item counts as one user
 // message (what it expands to upstream) and zero turns. The provider's
-// exact turn unit is its own; the default thresholds keep a wide
-// margin under the caps, and both are configurable.
+// exact turn unit is its own; both thresholds are configurable, and
+// the near-cap wait is the backstop when the margin runs out.
 //
 // Recursion: a request already containing a compaction_trigger (this
 // hook's side request, or Codex's own /compact) passes through
@@ -55,8 +70,8 @@
 //
 // Options (magpie plugin options <path> '{...}'):
 //   providers:       ["xingchi"]  provider id prefixes to guard
-//   userThreshold:   16           fold when user messages >= this
-//   turnThreshold:   70           fold when model turns >= this
+//   userThreshold:   19           start folding at this many user msgs
+//   turnThreshold:   95           start folding at this many model turns
 //   userCap:         20           provider hard cap on user messages
 //   turnCap:         100          provider hard cap on model turns
 //   keepRecentUsers: 3            user turns kept verbatim in the tail
@@ -64,9 +79,10 @@
 //   compactModel:    ""           model for the compaction side request;
 //                                 "" = the request's own model
 //   gatewayUrl:      "http://127.0.0.1:3425/v1"  this magpie's gateway
-//   gatewayTimeoutMs: (magpie hook option, set alike — a compaction
-//                                 over a long history is slow; 180000
-//                                 recommended)
+//   gatewayTimeoutMs: (magpie hook option, set alike — the host clamps
+//                                 it to at most 30000 ms, which bounds
+//                                 the whole hook chain; folding itself
+//                                 runs in the background, see below)
 // The gateway bearer token is read at runtime from ~/.codex/config.toml
 // ([model_providers.magpie] experimental_bearer_token) so no secret is
 // stored in the plugin or its options.
@@ -88,8 +104,8 @@ const CODEX_CONFIG = homedir() + "/.codex/config.toml";
 
 const DEFAULTS = {
   providers: ["xingchi"],
-  userThreshold: 16,
-  turnThreshold: 70,
+  userThreshold: 19,
+  turnThreshold: 95,
   userCap: 20,
   turnCap: 100,
   keepRecentUsers: 3,
@@ -97,6 +113,14 @@ const DEFAULTS = {
   compactModel: "",
   gatewayUrl: "http://127.0.0.1:3425/v1",
 };
+
+// Folds in flight, by conversation key: the compaction side requests
+// run in the background (the hook chain's budget is far shorter than
+// a compaction), and the finished item is picked up from state by
+// later requests. One job per conversation at a time.
+// NEAR_CAP_WAIT_MS stays inside the host's hook budget (~30 s).
+const inflight = new Map();
+const NEAR_CAP_WAIT_MS = 25000;
 
 function loadState() {
   for (const p of STATE_CANDIDATES) {
@@ -365,98 +389,163 @@ export async function onRequest(body, ctx) {
       return undefined;
     }
 
-    // --- Fold: keep a tail within the keep budgets, compact the rest.
-    let lastUserIdx = -1;
-    for (let i = input.length - 1; i >= restStart; i--) {
-      if (isUserMsg(input[i])) {
-        lastUserIdx = i;
-        break;
-      }
-    }
-    if (lastUserIdx < 0) return priorItem ? { ...body, input: effective } : undefined;
+    // --- Over a threshold. Folding is asynchronous: magpie gives the
+    // whole request-hook chain a hard budget (a hook's
+    // gatewayTimeoutMs is clamped to at most 30 s by the host), and a
+    // compaction side request over a long history routinely takes
+    // longer — a hook that waits for it is timed out and its result
+    // discarded ("gateway request hook failed or timed out; keeping
+    // request"). So the fold runs in the background: this request
+    // goes out as it came (or with the previous fold spliced in), the
+    // finished fold is saved to state, and later requests splice it
+    // in on the fast path above. Only when the counts are about to
+    // hit the provider cap do we wait — within the budget — for an
+    // in-flight fold, rather than let the request die at the cap.
+    const nearCap =
+      effStats.users >= opts.userCap - 1 || effStats.turns >= opts.turnCap - 3;
 
-    let cut = chooseCut(input, restStart + 1, lastUserIdx, opts);
-    if (cut <= restStart) return priorItem ? { ...body, input: effective } : undefined;
-
-    const foldRaw = input.slice(restStart, cut);
-    const tail = input.slice(cut);
-    if (!foldRaw.length) return priorItem ? { ...body, input: effective } : undefined;
-
-    // Mid-history system/developer items keep their place in the live
-    // request (before the compaction item); the rest is compacted.
-    const keptSys = [...keptSysPrior, ...foldRaw.filter(isSysDev)];
-    const toFold = foldRaw.filter((it) => !isSysDev(it));
-    if (!toFold.length) return priorItem ? { ...body, input: effective } : undefined;
-
-    // Compact the fold portion, in slices if needed: a compaction side
-    // request must itself stay under the caps (magpie adds the compact
-    // prompt as one more user message, and the provider counts the
-    // turns it is shown), so a history that is already far over the
-    // cap is folded slice by slice — each slice's request carries the
-    // previous slice's item, which magpie expands, so the final item
-    // covers everything. With the default thresholds a fold is a
-    // single slice.
-    let item = priorItem;
-    {
-      // Slice ends: indices of toFold where a turn has just ended (or
-      // the end of the array) — a slice never cuts a turn in half.
-      const ends = [];
-      {
-        let inTurn = false;
-        for (let i = 0; i < toFold.length; i++) {
-          const it = toFold[i];
-          if (!it || typeof it !== "object") continue;
-          if (isAssistantMsg(it) || MODEL_SIDE.has(it.type)) inTurn = true;
-          else if (TOOL_OUT.has(it.type) || isClientMsg(it) || isCompaction(it)) {
-            if (inTurn) ends.push(i + 1);
-            inTurn = false;
-          }
+    let job = inflight.get(headKey);
+    if (!job) {
+      // Plan the fold from this request's snapshot: keep a tail
+      // within the keep budgets, compact the rest.
+      let lastUserIdx = -1;
+      for (let i = input.length - 1; i >= restStart; i--) {
+        if (isUserMsg(input[i])) {
+          lastUserIdx = i;
+          break;
         }
-        if (!ends.length || ends[ends.length - 1] !== toFold.length) ends.push(toFold.length);
       }
-      let pos = 0;
-      let slices = 0;
-      while (pos < toFold.length) {
-        if (++slices > 32) throw new Error("compaction needs too many slices");
-        // Largest slice end whose side request stays under the caps;
-        // the first end past pos if even that does not fit (best
-        // effort: one whole turn is the smallest unit there is).
-        let chosen = -1;
-        for (const e of ends) {
-          if (e <= pos) continue;
-          const s = countStats([...head, ...(item ? [item] : []), ...toFold.slice(pos, e)], 0);
-          if (s.users <= opts.userCap - 1 && s.turns <= opts.turnCap - 5) {
-            chosen = e;
-          } else {
-            if (chosen < 0) chosen = e;
-            break;
+      // No user message after the frontier — one marathon user turn
+      // whose tool rounds alone crossed the threshold. Fold its older
+      // rounds anyway (the tail keeps the recent ones); anchoring the
+      // cut search at the head user message is safe, the cut itself
+      // still has to be a clean one.
+      if (lastUserIdx < 0) lastUserIdx = firstUser;
+
+      const cut = chooseCut(input, restStart + 1, lastUserIdx, opts);
+      if (cut <= restStart) return priorItem ? { ...body, input: effective } : undefined;
+
+      const foldRaw = input.slice(restStart, cut);
+      if (!foldRaw.length) return priorItem ? { ...body, input: effective } : undefined;
+
+      // Mid-history system/developer items keep their place in the
+      // live request (before the compaction item); the rest is
+      // compacted.
+      const keptSys = [...keptSysPrior, ...foldRaw.filter(isSysDev)];
+      const toFold = foldRaw.filter((it) => !isSysDev(it));
+      if (!toFold.length) return priorItem ? { ...body, input: effective } : undefined;
+
+      const snapshot = input;
+      const baseItem = priorItem;
+      const baseFolds = priorItem ? sess.folds || 1 : 0;
+      job = (async () => {
+        try {
+          // Compact the fold portion, in slices if needed: a
+          // compaction side request must itself stay under the caps
+          // (magpie adds the compact prompt as one more user message,
+          // and the provider counts the turns it is shown), so a
+          // history that is already far over the cap is folded slice
+          // by slice — each slice's request carries the previous
+          // slice's item, which magpie expands, so the final item
+          // covers everything. With the default thresholds a fold is
+          // a single slice.
+          let item = baseItem;
+          // Slice ends: indices of toFold where a turn has just ended
+          // (or the end of the array) — a slice never cuts a turn in
+          // half.
+          const ends = [];
+          {
+            let inTurn = false;
+            for (let i = 0; i < toFold.length; i++) {
+              const it = toFold[i];
+              if (!it || typeof it !== "object") continue;
+              if (isAssistantMsg(it) || MODEL_SIDE.has(it.type)) inTurn = true;
+              else if (TOOL_OUT.has(it.type) || isClientMsg(it) || isCompaction(it)) {
+                if (inTurn) ends.push(i + 1);
+                inTurn = false;
+              }
+            }
+            if (!ends.length || ends[ends.length - 1] !== toFold.length) ends.push(toFold.length);
           }
+          let pos = 0;
+          let slices = 0;
+          while (pos < toFold.length) {
+            if (++slices > 32) return null;
+            // Largest slice end whose side request stays under the
+            // caps; the first end past pos if even that does not fit
+            // (best effort: one whole turn is the smallest unit).
+            let chosen = -1;
+            for (const e of ends) {
+              if (e <= pos) continue;
+              const s = countStats([...head, ...(item ? [item] : []), ...toFold.slice(pos, e)], 0);
+              if (s.users <= opts.userCap - 1 && s.turns <= opts.turnCap - 5) {
+                chosen = e;
+              } else {
+                if (chosen < 0) chosen = e;
+                break;
+              }
+            }
+            if (chosen < 0) return null;
+            item = await callCompaction(
+              [...head, ...(item ? [item] : []), ...toFold.slice(pos, chosen)],
+              opts.compactModel || body.model,
+              opts,
+            );
+            pos = chosen;
+          }
+          if (!item || pos < toFold.length) return null;
+
+          const newFrontier = priorFolded + foldRaw.length;
+          const st = loadState();
+          st.sessions[headKey] = {
+            v: 2,
+            compactionItem: item,
+            keptSys,
+            frontierItems: newFrontier,
+            prefixHash: hashItems(snapshot.slice(headEnd, headEnd + newFrontier)),
+            folds: baseFolds + 1,
+            updatedAt: Date.now(),
+          };
+          saveState(st);
+          return item;
+        } catch {
+          return null;
         }
-        if (chosen < 0) break;
-        item = await callCompaction(
-          [...head, ...(item ? [item] : []), ...toFold.slice(pos, chosen)],
-          opts.compactModel || body.model,
-          opts,
-        );
-        pos = chosen;
-      }
-      if (!item || pos < toFold.length) {
-        return priorItem ? { ...body, input: effective } : undefined;
-      }
+      })();
+      inflight.set(headKey, job);
+      const done = () => {
+        if (inflight.get(headKey) === job) inflight.delete(headKey);
+      };
+      job.then(done, done);
     }
 
-    const newFrontier = priorFolded + foldRaw.length;
-    state.sessions[headKey] = {
-      v: 2,
-      compactionItem: item,
-      keptSys,
-      frontierItems: newFrontier,
-      prefixHash: hashItems(input.slice(headEnd, headEnd + newFrontier)),
-      folds: (priorItem ? sess.folds || 1 : 0) + 1,
-      updatedAt: Date.now(),
-    };
-    saveState(state);
-    return { ...body, input: [...head, ...keptSys, item, ...tail] };
+    // A previous fold keeps serving while the new one brews.
+    if (priorItem && !nearCap) return { ...body, input: effective };
+    if (!nearCap) return undefined;
+
+    // About to hit the cap: wait for the fold, within the hook
+    // budget, and splice it into this request if it lands in time.
+    const landed = await Promise.race([
+      job,
+      new Promise((r) => setTimeout(() => r(null), NEAR_CAP_WAIT_MS)),
+    ]);
+    if (!landed) return priorItem ? { ...body, input: effective } : undefined;
+    const st2 = loadState();
+    const s2 = st2.sessions[headKey];
+    if (
+      s2 &&
+      s2.compactionItem &&
+      s2.frontierItems > 0 &&
+      headEnd + s2.frontierItems <= input.length &&
+      hashItems(input.slice(headEnd, headEnd + s2.frontierItems)) === s2.prefixHash
+    ) {
+      const kept2 = Array.isArray(s2.keptSys) ? s2.keptSys : [];
+      return {
+        ...body,
+        input: [...head, ...kept2, s2.compactionItem, ...input.slice(headEnd + s2.frontierItems)],
+      };
+    }
+    return priorItem ? { ...body, input: effective } : undefined;
   } catch {
     return undefined; // fail open: send the request as it came
   }

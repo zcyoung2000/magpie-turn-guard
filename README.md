@@ -35,6 +35,16 @@ own compaction** when either reaches its threshold:
   per session, so later requests only splice (no model call) until the
   spliced history would again reach a threshold — then a new
   compaction merges the previous item with the newly folded turns.
+- Folding is **asynchronous**: magpie bounds the whole request-hook
+  chain to ~30 s (a hook's `gatewayTimeoutMs` is clamped to at most
+  30000 ms), and a compaction over a long history routinely takes
+  longer — a hook that waits for it is timed out and its rewritten
+  body discarded. So crossing a threshold only *starts* the fold in
+  the background; the request goes out as it came, and once the fold
+  has landed in the state file, later requests splice it in. The one
+  exception: when the counts are about to hit the cap itself, the
+  hook waits for the in-flight fold (25 s, inside the budget) and
+  splices it into that request.
 - A compaction side request must itself stay under the caps, so a
   history that is already far over them (the hook was off, the session
   predates it) is folded **in slices**: each slice's request carries
@@ -55,7 +65,7 @@ GUI's options editor starts from).
 
 ```sh
 magpie plugin add /path/to/magpie-turn-guard
-magpie plugin options /path/to/magpie-turn-guard '{"gatewayTimeoutMs":180000,"userThreshold":19,"turnThreshold":95}'
+magpie plugin options /path/to/magpie-turn-guard '{"gatewayTimeoutMs":30000,"userThreshold":19,"turnThreshold":95}'
 ```
 
 Options can also be edited in the magpie GUI: Plugins page → the
@@ -82,7 +92,7 @@ Set via magpie plugin options (JSON):
 | `keepRecentTurns` | `20` | Model turns kept verbatim in the tail |
 | `compactModel` | `""` | Model for the compaction side request; empty = the request's own model |
 | `gatewayUrl` | `http://127.0.0.1:3425/v1` | Gateway base URL for the side request |
-| `gatewayTimeoutMs` | (host option) | Must allow a full compaction; 180000 recommended |
+| `gatewayTimeoutMs` | (host option) | The host clamps it to at most 30000 ms — that is the whole hook chain's budget. Folding itself runs in the background (see below), so 30000 is right. |
 
 ## Test
 

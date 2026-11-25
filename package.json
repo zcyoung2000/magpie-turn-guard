@@ -5,7 +5,7 @@
     "name": "turn-guard",
     "options": {
       "compactModel": "",
-      "gatewayTimeoutMs": 180000,
+      "gatewayTimeoutMs": 30000,
       "gatewayUrl": "http://127.0.0.1:3425/v1",
       "keepRecentTurns": 20,
       "keepRecentUsers": 3,
@@ -20,5 +20,5 @@
   },
   "name": "turn-guard",
   "private": true,
-  "version": "2.0.0"
+  "version": "2.1.0"
 }
