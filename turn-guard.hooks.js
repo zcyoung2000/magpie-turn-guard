@@ -1,39 +1,72 @@
-// turn-guard — magpie gateway hook (Bun, async request hook)
+// turn-guard — magpie gateway hook (Bun, async request hook), v2
 //
 // Purpose: some relays (e.g. xingchi) reject a Responses request whose
-// `input` contains more than N user messages (xingchi: 10 max, the 11th
-// gets a 400 session_turn_limit_exceeded before the model ever sees it).
-// Codex only compacts on a token budget, so a long session with many
-// small turns dies on the turn count long before the token limit.
+// history has grown past a provider cap — xingchi (verified 2026-11-25):
+// more than 20 user messages, or more than 100 model turns, in the
+// request's `input` gets a 400 session_turn_limit_exceeded before the
+// model ever sees it. Codex only compacts on a token budget, so a long
+// session with many small turns dies on the turn count long before the
+// token limit — and once it is over the cap even Codex's own /compact
+// dies, because the compaction request carries the same over-cap
+// history. The fold has to happen BEFORE the cap, which is this hook.
 //
-// This hook runs before routing. For configured providers (matched by
-// the model name's provider prefix, e.g. "xingchi/gpt-6.1-sol"), when
-// the user-turn count reaches `threshold`, it folds the older turns
-// into one summary user message — the same shape Codex's own compaction
-// produces (environment context + summary + recent turns verbatim).
+// Mechanism: Codex's OWN compaction, not a hand-written summary. When
+// the user-message count or the model-turn count of a request reaches
+// the configured threshold, the hook sends the older history plus a
+// `compaction_trigger` item to the same gateway as a side request.
+// magpie answers a trigger for one of its models itself: it swaps the
+// trigger for Codex's official compact prompt, the model writes the
+// handoff summary, and magpie seals it into a `compaction` item
+// (encrypted_content "magpie1:...") returned in the response. The hook
+// splices that item into the live request in place of the folded
+// history; on later requests magpie expands the item back into the
+// official summary user message, so upstream sees a short history:
+// head + one summary user message + the recent tail.
 //
 // Incremental: the client resends its full raw history every request,
 // so the hook remembers, per conversation, how many leading items are
-// already folded into the stored summary (the "frontier"). Later
-// requests just splice [head, summary, ...unfolded tail] with NO model
-// call; a new summary is written only when the spliced request would
-// itself exceed `maxUsers` — roughly one summary call per
-// (maxUsers - keepRecent - 1) new turns instead of one per turn.
-// The fold call merges the previous summary with the newly folded
-// turns, so facts survive repeated folds. The client's own token-based
-// compaction is untouched (it changes the history's head, which this
-// hook detects as a new conversation and starts over).
+// already folded into the stored compaction item (the "frontier").
+// Later requests just splice [head, item, ...unfolded tail] with NO
+// model call; a new compaction runs only when the spliced request
+// would itself reach a threshold — and then the trigger request
+// carries the previous item (magpie expands it), so the new summary
+// merges the old one with the newly folded turns. A compaction side
+// request must itself stay under the caps, so a history that is
+// already far over them (the hook was off, the session predates it)
+// is folded in slices: each slice's request carries the previous
+// slice's item, and the final item covers everything. The client's own
+// token-based compaction is untouched: it puts a compaction item of
+// its own in the history, counts restart after it, and this hook's
+// state for the old history simply stops matching and is dropped.
+//
+// Counting: a "model turn" is one model response — a run of model-side
+// items (reasoning / assistant message / tool calls) ended by a user or
+// developer message or a tool output. On a real 190-call Codex session
+// this count came out at 189. A compaction item counts as one user
+// message (what it expands to upstream) and zero turns. The provider's
+// exact turn unit is its own; the default thresholds keep a wide
+// margin under the caps, and both are configurable.
+//
+// Recursion: a request already containing a compaction_trigger (this
+// hook's side request, or Codex's own /compact) passes through
+// untouched.
 //
 // Fail-open: any error returns undefined and the request goes out as-is.
 //
 // Options (magpie plugin options <path> '{...}'):
-//   providers:    ["xingchi"]            provider id prefixes to guard
-//   threshold:    9                      first fold when user turns >= this
-//   maxUsers:     10                     never send more user msgs than this
-//   keepRecent:   3                      newest user turns kept verbatim
-//   summaryModel: "xingchi/gpt-6.1-sol"  model asked to write summaries
-//   gatewayUrl:   "http://127.0.0.1:3425/v1"  this magpie's own gateway
-//   gatewayTimeoutMs: 30000              (magpie hook option, set alike)
+//   providers:       ["xingchi"]  provider id prefixes to guard
+//   userThreshold:   16           fold when user messages >= this
+//   turnThreshold:   70           fold when model turns >= this
+//   userCap:         20           provider hard cap on user messages
+//   turnCap:         100          provider hard cap on model turns
+//   keepRecentUsers: 3            user turns kept verbatim in the tail
+//   keepRecentTurns: 20           model turns kept verbatim in the tail
+//   compactModel:    ""           model for the compaction side request;
+//                                 "" = the request's own model
+//   gatewayUrl:      "http://127.0.0.1:3425/v1"  this magpie's gateway
+//   gatewayTimeoutMs: (magpie hook option, set alike — a compaction
+//                                 over a long history is slow; 180000
+//                                 recommended)
 // The gateway bearer token is read at runtime from ~/.codex/config.toml
 // ([model_providers.magpie] experimental_bearer_token) so no secret is
 // stored in the plugin or its options.
@@ -55,10 +88,13 @@ const CODEX_CONFIG = homedir() + "/.codex/config.toml";
 
 const DEFAULTS = {
   providers: ["xingchi"],
-  threshold: 9,
-  maxUsers: 10,
-  keepRecent: 3,
-  summaryModel: "xingchi/gpt-6.1-sol",
+  userThreshold: 16,
+  turnThreshold: 70,
+  userCap: 20,
+  turnCap: 100,
+  keepRecentUsers: 3,
+  keepRecentTurns: 20,
+  compactModel: "",
   gatewayUrl: "http://127.0.0.1:3425/v1",
 };
 
@@ -105,49 +141,105 @@ function isUserMsg(item) {
   return item && item.role === "user" && (item.type === "message" || item.type === undefined);
 }
 
-function countUsers(items) {
-  let n = 0;
-  for (const it of items) if (isUserMsg(it)) n++;
-  return n;
+function isAssistantMsg(item) {
+  return item && item.role === "assistant" && (item.type === "message" || item.type === undefined);
 }
 
-function itemText(item) {
-  const c = item && item.content;
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) {
-    return c
-      .map((p) => (typeof p === "string" ? p : p.text || ""))
-      .filter(Boolean)
-      .join("\n");
+function isClientMsg(item) {
+  // user / developer / system message: client-side, ends a model turn
+  return (
+    item &&
+    (item.type === "message" || item.type === undefined) &&
+    (item.role === "user" || item.role === "developer" || item.role === "system")
+  );
+}
+
+function isCompaction(item) {
+  return item && (item.type === "compaction" || item.type === "compaction_summary");
+}
+
+function isTrigger(item) {
+  return item && item.type === "compaction_trigger";
+}
+
+const MODEL_SIDE = new Set(["reasoning", "function_call", "custom_tool_call", "tool_search_call"]);
+const TOOL_OUT = new Set(["function_call_output", "custom_tool_call_output", "tool_search_output"]);
+
+function isSysDev(item) {
+  return item && (item.role === "system" || item.role === "developer");
+}
+
+// User messages and model turns in items[start..]. A compaction item
+// counts as one user message (it expands to the summary user message
+// upstream) and no turn.
+function countStats(items, start) {
+  let users = 0;
+  let turns = 0;
+  let inTurn = false;
+  for (let i = start; i < items.length; i++) {
+    const it = items[i];
+    if (!it || typeof it !== "object") continue;
+    if (isUserMsg(it)) {
+      users++;
+      inTurn = false;
+    } else if (isCompaction(it)) {
+      users++;
+      inTurn = false;
+    } else if (isAssistantMsg(it) || MODEL_SIDE.has(it.type)) {
+      if (!inTurn) {
+        turns++;
+        inTurn = true;
+      }
+    } else if (TOOL_OUT.has(it.type) || isClientMsg(it)) {
+      inTurn = false;
+    }
   }
-  return "";
+  return { users, turns };
+}
+
+// A clean place to cut the history: the tail may start here without
+// orphaning a tool output (its call folded away) — a client message, a
+// developer message, or a model-side item that begins a fresh turn
+// (the previous item is a tool output or a client message).
+function isCleanCut(items, i) {
+  if (i <= 0 || i >= items.length) return i === items.length;
+  const it = items[i];
+  if (!it || typeof it !== "object") return false;
+  if (isClientMsg(it)) return true;
+  if (isAssistantMsg(it) || MODEL_SIDE.has(it.type)) {
+    const prev = items[i - 1];
+    return !!prev && (TOOL_OUT.has(prev.type) || isClientMsg(prev));
+  }
+  return false;
+}
+
+// Smallest clean cut index in (from, lastUserIdx] whose tail satisfies
+// both keep budgets; if none does, the smallest clean cut after
+// lastUserIdx that satisfies the turn budget (a single user turn with
+// more tool rounds than the budget); if still none, the last clean cut.
+function chooseCut(items, from, lastUserIdx, opts) {
+  let lastClean = -1;
+  for (let i = from; i <= items.length; i++) {
+    if (!isCleanCut(items, i)) continue;
+    lastClean = i;
+    const s = countStats(items, i);
+    if (s.users <= opts.keepRecentUsers && s.turns <= opts.keepRecentTurns) {
+      if (i <= lastUserIdx) return i;
+      if (lastClean === i && i > lastUserIdx) return i; // first clean cut past the last user turn that fits
+    }
+  }
+  return lastClean;
 }
 
 function hashItems(items) {
   return createHash("sha256").update(JSON.stringify(items)).digest("hex");
 }
 
-function serialize(items) {
-  const lines = [];
-  for (const item of items) {
-    if (!item || typeof item !== "object") continue;
-    if (item.type === "message" || item.role) {
-      const t = itemText(item).slice(0, 2000);
-      if (t) lines.push(`${item.role || "user"}: ${t}`);
-    } else if (item.type === "function_call") {
-      lines.push(`assistant tool_call ${item.name}(${(item.arguments || "").slice(0, 300)})`);
-    } else if (item.type === "function_call_output") {
-      lines.push(`tool_output: ${(item.output || "").slice(0, 500)}`);
-    }
-  }
-  let text = lines.join("\n");
-  if (text.length > 60000) {
-    text = text.slice(0, 40000) + "\n[... middle truncated for summarization ...]\n" + text.slice(-20000);
-  }
-  return text;
-}
-
-async function callSummaryModel(promptText, opts) {
+// Ask the gateway to compact `inputItems` with Codex's own compaction
+// and return the sealed compaction item. magpie answers the trigger
+// itself with an SSE stream whose output item is the compaction item;
+// a plain JSON response carrying one is accepted too.
+async function callCompaction(inputItems, model, opts) {
   const token = gatewayToken();
   const res = await fetch(opts.gatewayUrl + "/responses", {
     method: "POST",
@@ -156,57 +248,45 @@ async function callSummaryModel(promptText, opts) {
       ...(token ? { Authorization: "Bearer " + token } : {}),
     },
     body: JSON.stringify({
-      model: opts.summaryModel,
-      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: promptText }] }],
+      model,
+      input: [...inputItems, { type: "compaction_trigger" }],
       stream: false,
     }),
   });
-  if (!res.ok) throw new Error("summary request failed: " + res.status);
-  const data = await res.json();
-  if (typeof data.output_text === "string" && data.output_text) return data.output_text;
-  for (const item of data.output || []) {
-    for (const part of item.content || []) {
-      if (part.type === "output_text" && part.text) return part.text;
+  if (!res.ok) throw new Error("compaction request failed: " + res.status);
+  const text = await res.text();
+  let item = null;
+  const take = (o) => {
+    if (o && o.type === "compaction" && typeof o.encrypted_content === "string" && o.encrypted_content) {
+      item = o;
+    }
+  };
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("data:")) continue;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    let ev;
+    try {
+      ev = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (ev.type === "response.output_item.done") take(ev.item);
+    if (ev.type === "response.completed" && ev.response && Array.isArray(ev.response.output)) {
+      for (const o of ev.response.output) take(o);
     }
   }
-  throw new Error("summary response had no text");
-}
-
-function summarizeFresh(items, opts) {
-  return callSummaryModel(
-    "Summarize the following conversation excerpt so the conversation can continue " +
-      "without the original turns. Preserve every fact, name, number, decision, " +
-      "constraint, identifier and codeword exactly. Be compact but complete.\n\n" +
-      serialize(items),
-    opts,
-  );
-}
-
-function summarizeFold(prevSummary, items, opts) {
-  return callSummaryModel(
-    "Here is the summary of the earlier part of a conversation, followed by more turns. " +
-      "Merge them into ONE updated summary so the conversation can continue without the " +
-      "original turns. Preserve every fact, name, number, decision, constraint, " +
-      "identifier and codeword exactly. Be compact but complete.\n\n" +
-      "=== Previous summary ===\n" +
-      prevSummary +
-      "\n\n=== More turns ===\n" +
-      serialize(items),
-    opts,
-  );
-}
-
-// Index in `items` where the last `k` user turns begin (item index of the
-// k-th-from-last user message). Returns items.length if fewer than k.
-function tailStartIndex(items, k) {
-  let seen = 0;
-  for (let i = items.length - 1; i >= 0; i--) {
-    if (isUserMsg(items[i])) {
-      seen++;
-      if (seen === k) return i;
-    }
+  if (!item && text.trim().startsWith("{")) {
+    try {
+      const data = JSON.parse(text);
+      for (const o of data.output || []) take(o);
+    } catch {}
   }
-  return 0;
+  if (!item) throw new Error("compaction response had no compaction item");
+  const out = { type: "compaction", encrypted_content: item.encrypted_content };
+  if (item.id) out.id = item.id;
+  return out;
 }
 
 export async function onRequest(body, ctx) {
@@ -217,85 +297,166 @@ export async function onRequest(body, ctx) {
     if (!opts.providers.includes(provider)) return undefined;
 
     const input = body.input;
-    const totalUsers = countUsers(input);
-    if (totalUsers < opts.threshold) return undefined;
+
+    // Already a compaction request (Codex's own /compact, or this
+    // hook's side request coming back through the gateway): untouched.
+    if (input.some(isTrigger)) return undefined;
 
     const firstUser = input.findIndex(isUserMsg);
     if (firstUser < 0) return undefined;
-    const headEnd = firstUser + 1; // leading system/developer items + first user (env context)
-    const head = input.slice(0, headEnd);
-    const headUsers = countUsers(head); // normally 1
 
-    // Conversation identity: hash of the head plus the first real turn,
-    // stable across the session's requests, changed by client compaction.
+    // If the client compacted natively, its item sits in the history
+    // and counts restart after it; everything up to and including it
+    // is the untouchable prefix for folding purposes.
+    let nativeIdx = -1;
+    for (let i = input.length - 1; i > firstUser; i--) {
+      if (isCompaction(input[i])) {
+        nativeIdx = i;
+        break;
+      }
+    }
+    const headEnd = nativeIdx >= 0 ? nativeIdx + 1 : firstUser + 1;
+    const head = input.slice(0, headEnd);
+
+    // Conversation identity: hash of the first two user messages (plus
+    // the client's own compaction item when present), stable across
+    // the session's requests, changed by client-side compaction.
     const secondUser = input.findIndex((it, i) => i > firstUser && isUserMsg(it));
-    const headKey = hashItems(secondUser >= 0 ? [input[firstUser], input[secondUser]] : [input[firstUser]]);
+    const keyParts = secondUser >= 0 ? [input[firstUser], input[secondUser]] : [input[firstUser]];
+    if (nativeIdx >= 0) keyParts.push(input[nativeIdx]);
+    const headKey = hashItems(keyParts);
 
     const state = loadState();
     const sess = state.sessions[headKey];
 
-    const summaryMsg = (text) => ({
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text: "[Earlier conversation compacted automatically by turn-guard]\n" + text }],
-    });
-
-    // --- Fast path: frontier still matches, splice without a model call
-    // unless the spliced request would itself exceed maxUsers.
-    if (sess && sess.frontierItems > 0) {
-      const folded = input.slice(headEnd, headEnd + sess.frontierItems);
-      if (folded.length === sess.frontierItems && hashItems(folded) === sess.prefixHash) {
-        const rest = input.slice(headEnd + sess.frontierItems);
-        const splicedUsers = headUsers + 1 + countUsers(rest);
-        if (splicedUsers <= opts.maxUsers) {
-          sess.updatedAt = Date.now();
-          saveState(state);
-          return { ...body, input: [...head, summaryMsg(sess.summary), ...rest] };
-        }
-        // Fold more: keep the last keepRecent user turns of `rest` verbatim,
-        // merge the old summary with everything before them.
-        const tIdx = tailStartIndex(rest, opts.keepRecent);
-        const foldItems = rest.slice(0, tIdx);
-        const tail = rest.slice(tIdx);
-        if (foldItems.length) {
-          const keptSys = foldItems.filter((it) => it && (it.role === "system" || it.role === "developer"));
-          const toFold = foldItems.filter((it) => !(it && (it.role === "system" || it.role === "developer")));
-          const newSummary = toFold.length ? await summarizeFold(sess.summary, toFold, opts) : sess.summary;
-          const newFrontier = sess.frontierItems + foldItems.length;
-          state.sessions[headKey] = {
-            summary: newSummary,
-            frontierItems: newFrontier,
-            prefixHash: hashItems(input.slice(headEnd, headEnd + newFrontier)),
-            folds: (sess.folds || 1) + 1,
-            updatedAt: Date.now(),
-          };
-          saveState(state);
-          return { ...body, input: [...head, ...keptSys, summaryMsg(newSummary), ...tail] };
-        }
-      }
-      // Frontier mismatch (history changed under us): fall through to a
-      // fresh fold of the whole conversation.
+    // Prior fold state counts only if it is a v2 entry and the folded
+    // prefix still matches the raw history item for item.
+    let priorItem = null;
+    let priorFolded = 0;
+    if (
+      sess &&
+      sess.compactionItem &&
+      sess.frontierItems > 0 &&
+      headEnd + sess.frontierItems <= input.length &&
+      hashItems(input.slice(headEnd, headEnd + sess.frontierItems)) === sess.prefixHash
+    ) {
+      priorItem = sess.compactionItem;
+      priorFolded = sess.frontierItems;
     }
 
-    // --- Fresh fold: summarize everything except the last keepRecent turns.
-    const restAll = input.slice(headEnd);
-    const tIdx = tailStartIndex(restAll, opts.keepRecent);
-    const foldItems = restAll.slice(0, tIdx);
-    const tail = restAll.slice(tIdx);
-    if (!foldItems.length) return undefined;
-    const keptSys = foldItems.filter((it) => it && (it.role === "system" || it.role === "developer"));
-    const toFold = foldItems.filter((it) => !(it && (it.role === "system" || it.role === "developer")));
-    if (!toFold.length) return undefined;
-    const summary = await summarizeFresh(toFold, opts);
+    const restStart = headEnd + priorFolded;
+    const rest = input.slice(restStart);
+    // System/developer items lifted out of the folded region in earlier
+    // folds; they keep their place before the compaction item on every
+    // splice, so the effective history does not change shape between
+    // the fold request and the requests after it.
+    const keptSysPrior = priorItem && Array.isArray(sess.keptSys) ? sess.keptSys : [];
+    const effective = priorItem ? [...head, ...keptSysPrior, priorItem, ...rest] : input;
+    const effStats = countStats(effective, 0);
+
+    // Below both thresholds: send the spliced history if we have one,
+    // the raw request if we don't.
+    if (effStats.users < opts.userThreshold && effStats.turns < opts.turnThreshold) {
+      if (priorItem) {
+        sess.updatedAt = Date.now();
+        saveState(state);
+        return { ...body, input: effective };
+      }
+      return undefined;
+    }
+
+    // --- Fold: keep a tail within the keep budgets, compact the rest.
+    let lastUserIdx = -1;
+    for (let i = input.length - 1; i >= restStart; i--) {
+      if (isUserMsg(input[i])) {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    if (lastUserIdx < 0) return priorItem ? { ...body, input: effective } : undefined;
+
+    let cut = chooseCut(input, restStart + 1, lastUserIdx, opts);
+    if (cut <= restStart) return priorItem ? { ...body, input: effective } : undefined;
+
+    const foldRaw = input.slice(restStart, cut);
+    const tail = input.slice(cut);
+    if (!foldRaw.length) return priorItem ? { ...body, input: effective } : undefined;
+
+    // Mid-history system/developer items keep their place in the live
+    // request (before the compaction item); the rest is compacted.
+    const keptSys = [...keptSysPrior, ...foldRaw.filter(isSysDev)];
+    const toFold = foldRaw.filter((it) => !isSysDev(it));
+    if (!toFold.length) return priorItem ? { ...body, input: effective } : undefined;
+
+    // Compact the fold portion, in slices if needed: a compaction side
+    // request must itself stay under the caps (magpie adds the compact
+    // prompt as one more user message, and the provider counts the
+    // turns it is shown), so a history that is already far over the
+    // cap is folded slice by slice — each slice's request carries the
+    // previous slice's item, which magpie expands, so the final item
+    // covers everything. With the default thresholds a fold is a
+    // single slice.
+    let item = priorItem;
+    {
+      // Slice ends: indices of toFold where a turn has just ended (or
+      // the end of the array) — a slice never cuts a turn in half.
+      const ends = [];
+      {
+        let inTurn = false;
+        for (let i = 0; i < toFold.length; i++) {
+          const it = toFold[i];
+          if (!it || typeof it !== "object") continue;
+          if (isAssistantMsg(it) || MODEL_SIDE.has(it.type)) inTurn = true;
+          else if (TOOL_OUT.has(it.type) || isClientMsg(it) || isCompaction(it)) {
+            if (inTurn) ends.push(i + 1);
+            inTurn = false;
+          }
+        }
+        if (!ends.length || ends[ends.length - 1] !== toFold.length) ends.push(toFold.length);
+      }
+      let pos = 0;
+      let slices = 0;
+      while (pos < toFold.length) {
+        if (++slices > 32) throw new Error("compaction needs too many slices");
+        // Largest slice end whose side request stays under the caps;
+        // the first end past pos if even that does not fit (best
+        // effort: one whole turn is the smallest unit there is).
+        let chosen = -1;
+        for (const e of ends) {
+          if (e <= pos) continue;
+          const s = countStats([...head, ...(item ? [item] : []), ...toFold.slice(pos, e)], 0);
+          if (s.users <= opts.userCap - 1 && s.turns <= opts.turnCap - 5) {
+            chosen = e;
+          } else {
+            if (chosen < 0) chosen = e;
+            break;
+          }
+        }
+        if (chosen < 0) break;
+        item = await callCompaction(
+          [...head, ...(item ? [item] : []), ...toFold.slice(pos, chosen)],
+          opts.compactModel || body.model,
+          opts,
+        );
+        pos = chosen;
+      }
+      if (!item || pos < toFold.length) {
+        return priorItem ? { ...body, input: effective } : undefined;
+      }
+    }
+
+    const newFrontier = priorFolded + foldRaw.length;
     state.sessions[headKey] = {
-      summary,
-      frontierItems: foldItems.length,
-      prefixHash: hashItems(foldItems),
-      folds: 1,
+      v: 2,
+      compactionItem: item,
+      keptSys,
+      frontierItems: newFrontier,
+      prefixHash: hashItems(input.slice(headEnd, headEnd + newFrontier)),
+      folds: (priorItem ? sess.folds || 1 : 0) + 1,
       updatedAt: Date.now(),
     };
     saveState(state);
-    return { ...body, input: [...head, ...keptSys, summaryMsg(summary), ...tail] };
+    return { ...body, input: [...head, ...keptSys, item, ...tail] };
   } catch {
     return undefined; // fail open: send the request as it came
   }
