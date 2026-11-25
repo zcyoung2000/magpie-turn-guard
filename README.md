@@ -48,10 +48,19 @@ own compaction** when either reaches its threshold:
 
 ## Install
 
+The plugin is a directory package: `package.json` declares
+`magpie.name` ("turn-guard", the name the magpie GUI shows),
+`magpie.hooks` (the hook file) and `magpie.options` (the template the
+GUI's options editor starts from).
+
 ```sh
-magpie plugin add /path/to/turn-guard.hooks.js
-magpie plugin options /path/to/turn-guard.hooks.js '{"gatewayTimeoutMs":180000,"userThreshold":16,"turnThreshold":70}'
+magpie plugin add /path/to/magpie-turn-guard
+magpie plugin options /path/to/magpie-turn-guard '{"gatewayTimeoutMs":180000,"userThreshold":16,"turnThreshold":70}'
 ```
+
+Options can also be edited in the magpie GUI: Plugins page → the
+"turn-guard" row → options editor (JSON, prefilled from the package
+template or the saved values).
 
 The gateway bearer token is read at runtime from `~/.codex/config.toml`
 (`[model_providers.magpie] experimental_bearer_token`); no secret is stored
