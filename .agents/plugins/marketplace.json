@@ -1,0 +1,12 @@
+{
+  "name": "magpie-turn-guard",
+  "interface": { "displayName": "Magpie Turn Guard" },
+  "plugins": [
+    {
+      "name": "magpie-turn-guard",
+      "source": { "source": "local", "path": "./codex-plugin" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Productivity"
+    }
+  ]
+}

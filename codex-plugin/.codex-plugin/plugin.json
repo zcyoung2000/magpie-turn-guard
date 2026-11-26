@@ -1,0 +1,11 @@
+{
+  "name": "magpie-turn-guard",
+  "version": "0.1.1",
+  "description": "Request native compaction on the owning shared Codex App Server after a turn ends; report unsupported hosts explicitly.",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Magpie Turn Guard",
+    "shortDescription": "Native compaction at idle turn boundaries"
+  }
+}
